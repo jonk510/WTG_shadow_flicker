@@ -47,96 +47,92 @@ def get_site_latlon(wtg_xy: np.ndarray, epsg_code: int) -> tuple[float, float]:
 # ── Cloud / sunshine data ─────────────────────────────────────────────────────
 def fetch_daily_sunshine(
     lat: float, lon: float, year: int,
-) -> tuple[dict[int, float], str, str]:
+) -> tuple[dict[int, float], str, str, "str | None"]:
     """
     Fetch daily clearness index for the full year.
 
     Returns
     -------
-    daily_kt    : {day_of_year: clearness_index}  (DOY 1-indexed, 1 = Jan 1)
-                  clearness_index: 0 = fully overcast, 1 = clear sky
-    source      : human-readable data source label
-    station_info: nearest station description (or "satellite-derived")
+    daily_kt      : {day_of_year: clearness_index}  (DOY 1-indexed, 1 = Jan 1)
+                    clearness_index: 0 = fully overcast, 1 = clear sky
+    source        : human-readable data source label
+    location_info : location description
+    fallback_note : None if primary source succeeded; reason string if fell back
 
     Strategy
     --------
-    1. Try nearest BOM station via meteostat (daily sunshine duration → kt).
-       Requires `pip install meteostat`. Falls back if unavailable or <180 days.
-    2. Fall back to NASA POWER daily ALLSKY_KT (satellite-derived).
+    1. Open-Meteo ERA5 reanalysis — daily sunshine duration in seconds (no extra
+       library required, free, global coverage, ~1 km grid calibrated to ground obs).
+    2. Fall back to NASA POWER daily ALLSKY_KT if Open-Meteo is unavailable.
     """
     import datetime, requests
     import numpy as np
     import pandas as pd
     import pvlib
 
-    # Pre-compute astronomical daylight minutes per day (for sunshine-duration→kt)
+    # Pre-compute astronomical daylight seconds per day (for sunshine-duration → kt)
     times = pd.date_range(f"{year}-01-01", f"{year+1}-01-01", freq="1h", tz="UTC")[:-1]
     n_days = len(times) // 24
     solpos = pvlib.solarposition.get_solarposition(times, lat, lon)
     el_arr = solpos["apparent_elevation"].values
-    max_day_min = np.array(
-        [int((el_arr[d * 24:(d + 1) * 24] > 0).sum()) * 60 for d in range(n_days)],
+    max_day_sec = np.array(
+        [int((el_arr[d * 24:(d + 1) * 24] > 0).sum()) * 3600 for d in range(n_days)],
         dtype=np.float32,
     )
 
-    # ── Option 1: BOM station via meteostat ───────────────────────────────────
+    # ── Option 1: Open-Meteo ERA5 reanalysis — daily sunshine duration ────────
+    om_note = None
     try:
-        from meteostat import Point, Daily as MetDaily, Stations
+        start_str = f"{year}-01-01"
+        end_str   = f"{year}-12-31"
+        url_om = (
+            "https://archive-api.open-meteo.com/v1/archive"
+            f"?latitude={lat:.4f}&longitude={lon:.4f}"
+            f"&start_date={start_str}&end_date={end_str}"
+            "&daily=sunshine_duration&timezone=UTC"
+        )
+        resp = requests.get(url_om, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        tsun_sec = data["daily"]["sunshine_duration"]   # seconds/day
 
-        point    = Point(lat, lon)
-        start_dt = datetime.datetime(year, 1, 1)
-        end_dt   = datetime.datetime(year, 12, 31)
-        df = MetDaily(point, start_dt, end_dt).fetch()
-
-        if not df.empty and "tsun" in df.columns:
-            tsun_vals = df["tsun"].values.astype(float)   # sunshine minutes/day
-            valid     = np.isfinite(tsun_vals)
-
-            if valid.sum() >= 180:
-                kt_daily: dict[int, float] = {}
-                for d in range(min(len(tsun_vals), n_days)):
-                    if valid[d] and max_day_min[d] > 0:
-                        doy = d + 1
-                        kt_daily[doy] = float(np.clip(tsun_vals[d] / max_day_min[d], 0.0, 1.0))
-
-                # Fill gaps with that month's mean from available data
-                monthly_sums: dict[int, list] = {}
-                for doy, kt in kt_daily.items():
-                    m = (datetime.date(year, 1, 1) + datetime.timedelta(days=doy - 1)).month
-                    monthly_sums.setdefault(m, []).append(kt)
-                monthly_mean = {m: float(np.mean(v)) for m, v in monthly_sums.items()}
-                for d in range(n_days):
+        valid = [v is not None and np.isfinite(v) for v in tsun_sec]
+        if sum(valid) >= 180:
+            kt_daily: dict[int, float] = {}
+            for d, (sec, ok) in enumerate(zip(tsun_sec, valid)):
+                if ok and max_day_sec[d] > 0:
                     doy = d + 1
-                    if doy not in kt_daily:
-                        m = (datetime.date(year, 1, 1) + datetime.timedelta(days=d)).month
-                        kt_daily[doy] = monthly_mean.get(m, 0.7)
+                    kt_daily[doy] = float(np.clip(sec / max_day_sec[d], 0.0, 1.0))
 
-                # Nearest station name and distance
-                try:
-                    stn = Stations().nearby(lat, lon).fetch(1)
-                    if not stn.empty:
-                        name = stn.iloc[0].get("name", "?")
-                        dist_km = float(stn.iloc[0].get("distance", 0)) / 1000
-                        stn_info = f"{name} ({dist_km:.1f} km)"
-                    else:
-                        stn_info = "nearest station"
-                except Exception:
-                    stn_info = "nearest station"
+            # Fill any missing days with that month's mean
+            monthly_sums: dict[int, list] = {}
+            for doy, kt in kt_daily.items():
+                m = (datetime.date(year, 1, 1) + datetime.timedelta(days=doy - 1)).month
+                monthly_sums.setdefault(m, []).append(kt)
+            monthly_mean = {m: float(np.mean(v)) for m, v in monthly_sums.items()}
+            for d in range(n_days):
+                doy = d + 1
+                if doy not in kt_daily:
+                    m = (datetime.date(year, 1, 1) + datetime.timedelta(days=d)).month
+                    kt_daily[doy] = monthly_mean.get(m, 0.7)
 
-                return kt_daily, "BOM / meteostat — daily sunshine duration", stn_info
-    except Exception:
-        pass
+            return kt_daily, "Open-Meteo ERA5 — daily sunshine duration", \
+                   f"{lat:.3f}°, {lon:.3f}°  (~1 km ERA5 grid)", None
+        else:
+            om_note = f"Open-Meteo returned only {sum(valid)} valid days (need ≥ 180)"
+    except Exception as e:
+        om_note = f"Open-Meteo unavailable: {e}"
 
     # ── Option 2: NASA POWER daily clearness index ────────────────────────────
-    url = (
+    url_np = (
         "https://power.larc.nasa.gov/api/temporal/daily/point"
         f"?parameters=ALLSKY_KT&community=RE"
         f"&longitude={lon:.4f}&latitude={lat:.4f}"
         f"&start={year}0101&end={year}1231&format=JSON"
     )
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(url_np, timeout=30)
     resp.raise_for_status()
-    raw      = resp.json()
+    raw       = resp.json()
     daily_raw = raw["properties"]["parameter"]["ALLSKY_KT"]
     kt_daily  = {}
     for key, val in daily_raw.items():
@@ -146,7 +142,8 @@ def fetch_daily_sunshine(
             kt_daily[doy] = float(np.clip(float(val), 0.0, 1.0))
         except Exception:
             pass
-    return kt_daily, "NASA POWER — daily clearness index", "satellite-derived"
+    return (kt_daily, "NASA POWER — daily clearness index",
+            "satellite-derived (~50 km grid)", om_note)
 
 
 # ── Core flicker computation ──────────────────────────────────────────────────

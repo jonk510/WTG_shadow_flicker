@@ -337,12 +337,15 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
         if apply_cloud:
             try:
                 with st.spinner("Fetching sunshine/cloud data…"):
-                    daily_kt, cloud_source, cloud_station = fetch_daily_sunshine(
-                        site_lat, site_lon, int(year))
+                    daily_kt, cloud_source, cloud_station, fallback_note = \
+                        fetch_daily_sunshine(site_lat, site_lon, int(year))
                 mean_kt = float(np.mean(list(daily_kt.values())))
                 st.success(
                     f"☀️ **{cloud_source}** — {cloud_station}  ·  "
                     f"mean annual KT: {mean_kt:.2f}")
+                if fallback_note:
+                    st.info(f"ℹ️ Open-Meteo not used — {fallback_note}. "
+                            f"Fell back to NASA POWER.")
             except Exception as e:
                 st.warning(f"Could not fetch cloud data: {e}. Showing worst-case only.")
 
