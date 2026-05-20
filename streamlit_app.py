@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from shadow_flicker import (
     DEFAULT_EPSG, DEFAULT_HUB_HEIGHT_M, DEFAULT_ROTOR_DIAM_M,
     DEFAULT_BLADE_CHORD_M, NEPC_CHORD_MULTIPLIER,
-    DEFAULT_RECEIVER_HT_M, DEFAULT_FLICKER_LEVELS, DEFAULT_MIN_SUN_EL_DEG,
+    DEFAULT_RECEIVER_HT_M, DEFAULT_MIN_SUN_EL_DEG,
+    DEFAULT_ANNUAL_THRESHOLD, DEFAULT_CLOUD_THRESHOLD,
     get_site_latlon, compute_shadow_flicker, compute_receptor_flicker,
     fetch_cloud_correction, apply_cloud_correction,
     plot_flicker_results,
@@ -158,17 +159,6 @@ with st.sidebar:
         help="Smaller = finer contours but slower computation.")
     buffer_m = st.number_input(
         "Buffer beyond layout (m)", value=3000.0, min_value=500.0, step=500.0)
-
-    st.divider()
-    st.subheader("Contour levels (hr/yr)")
-    levels_str = st.text_input(
-        "Comma-separated", value=", ".join(str(x) for x in DEFAULT_FLICKER_LEVELS))
-    try:
-        contour_levels = sorted(float(x.strip())
-                                for x in levels_str.split(",") if x.strip())
-    except ValueError:
-        contour_levels = list(DEFAULT_FLICKER_LEVELS)
-        st.warning("Invalid levels — using defaults.")
 
     alpha_fill = st.slider("Contour opacity", 0.10, 1.0, 0.60, 0.05)
 
@@ -378,7 +368,8 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
         # Plot
         fig = plot_flicker_results(
             wtg_xy, flicker_annual, flicker_max_day, xx, yy,
-            contour_levels, int(epsg_code),
+            int(epsg_code),
+            annual_threshold=DEFAULT_ANNUAL_THRESHOLD,
             use_satellite=use_satellite,
             alpha_fill=alpha_fill,
             hub_height=hub_height,
@@ -407,7 +398,8 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
             st.markdown("**Cloud-corrected estimate (indicative, not NEPC compliance)**")
             fig_c = plot_flicker_results(
                 wtg_xy, flicker_corrected, flicker_max_day * (sum(cloud_data.values())/12),
-                xx, yy, contour_levels, int(epsg_code),
+                xx, yy, int(epsg_code),
+                annual_threshold=DEFAULT_CLOUD_THRESHOLD,
                 use_satellite=use_satellite, alpha_fill=alpha_fill,
                 hub_height=hub_height, rotor_diameter=rotor_diameter, year=int(year),
                 receptor_xy=receptor_xy,
@@ -415,6 +407,7 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
                                  if receptor_annual is not None else None),
                 receptor_max_day=receptor_max_day_arr,
                 receptor_names=receptor_names,
+                is_cloud_corrected=True,
             )
             fig_c.set_dpi(120)
             st.pyplot(fig_c, use_container_width=True)
@@ -459,10 +452,12 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
         grid_pts   = np.column_stack([xx.ravel(), yy.ravel()])
         r_from_cen = np.sqrt(((grid_pts - centroid) ** 2).sum(axis=1))
         stat_rows  = []
-        for lv in contour_levels:
+        for lv in [DEFAULT_ANNUAL_THRESHOLD, DEFAULT_CLOUD_THRESHOLD]:
             m    = flat >= lv
             r_lv = float(r_from_cen[m].max()) if m.any() else 0.0
-            stat_rows.append({"Contour (hr/yr)": lv,
+            label = f"{lv:g} hr/yr (NEPC worst-case)" if lv == DEFAULT_ANNUAL_THRESHOLD \
+                    else f"{lv:g} hr/yr (cloud-corrected indicative)"
+            stat_rows.append({"Threshold": label,
                                "Max radius (m)": round(r_lv, 0)})
         st.dataframe(pd.DataFrame(stat_rows), use_container_width=True,
                      hide_index=True)
