@@ -29,7 +29,7 @@ DEFAULT_BLADE_CHORD_M   = 4.5                 # typical blade chord (m)
 # NEPC 2010: assess within 265 × max blade chord
 NEPC_CHORD_MULTIPLIER   = 265
 DEFAULT_FLICKER_LEVELS  = [10, 20, 30, 50, 100]   # contour levels (hrs/yr)
-DEFAULT_EPSG            = 28354                    # GDA94 / MGA zone 54
+DEFAULT_EPSG            = 7850                     # GDA2020 / MGA zone 50
 
 
 # ── Coordinate helper ─────────────────────────────────────────────────────────
