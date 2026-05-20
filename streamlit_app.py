@@ -26,7 +26,7 @@ from shadow_flicker import (
     DEFAULT_RECEIVER_HT_M, DEFAULT_MIN_SUN_EL_DEG,
     DEFAULT_ANNUAL_THRESHOLD, DEFAULT_CLOUD_THRESHOLD, DEFAULT_FLICKER_LEVELS,
     get_site_latlon, compute_shadow_flicker, compute_receptor_flicker,
-    fetch_cloud_correction, apply_cloud_correction,
+    fetch_daily_sunshine,
     plot_flicker_results,
 )
 
@@ -330,49 +330,56 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
         # Site lat/lon
         site_lat, site_lon = get_site_latlon(wtg_xy, int(epsg_code))
 
-        # Progress bar
+        # ── Fetch cloud data first (before computation) ───────────────────────
+        daily_kt     = None
+        cloud_source = None
+        cloud_station = None
+        if apply_cloud:
+            try:
+                with st.spinner("Fetching sunshine/cloud data…"):
+                    daily_kt, cloud_source, cloud_station = fetch_daily_sunshine(
+                        site_lat, site_lon, int(year))
+                mean_kt = float(np.mean(list(daily_kt.values())))
+                st.success(
+                    f"☀️ **{cloud_source}** — {cloud_station}  ·  "
+                    f"mean annual KT: {mean_kt:.2f}")
+            except Exception as e:
+                st.warning(f"Could not fetch cloud data: {e}. Showing worst-case only.")
+
+        # ── Main flicker computation ──────────────────────────────────────────
         prog_bar = st.progress(0.0, text="Computing solar positions and flicker…")
 
         def _progress(frac):
             prog_bar.progress(min(frac, 1.0),
                               text=f"Processing days… {frac*100:.0f}%")
 
-        flicker_annual, flicker_max_day, flicker_by_month = compute_shadow_flicker(
+        (flicker_annual, flicker_max_day, flicker_by_month,
+         flicker_corrected, flicker_corrected_max_day) = compute_shadow_flicker(
             wtg_xy, rotor_diameter, hub_height, xx, yy,
             site_lat, site_lon,
             year=int(year),
             receiver_height=float(receiver_height),
             min_sun_el_deg=float(min_sun_el),
+            daily_kt=daily_kt,
             progress_cb=_progress,
         )
         prog_bar.progress(1.0, text="Done!")
 
-        # Cloud correction
-        flicker_corrected = None
-        cloud_data = None
-        if apply_cloud:
-            try:
-                with st.spinner("Fetching cloud data from NASA POWER…"):
-                    cloud_data = fetch_cloud_correction(site_lat, site_lon, int(year))
-                flicker_corrected = apply_cloud_correction(flicker_by_month, cloud_data)
-                mean_kt = sum(cloud_data.values()) / len(cloud_data)
-                st.success(
-                    f"Cloud correction applied — mean annual clearness index: "
-                    f"{mean_kt:.2f} (1.0 = always clear)")
-            except Exception as e:
-                st.warning(f"Could not fetch cloud data: {e}. Showing worst-case only.")
-
-        # Receptor flicker
-        receptor_annual  = None
-        receptor_max_day_arr = None
+        # ── Receptor flicker ──────────────────────────────────────────────────
+        receptor_annual              = None
+        receptor_max_day_arr         = None
+        receptor_corrected_annual    = None
+        receptor_corrected_max_day   = None
         if receptor_xy is not None:
             st.write("Calculating receptor flicker levels…")
-            receptor_annual, receptor_max_day_arr = compute_receptor_flicker(
+            (receptor_annual, receptor_max_day_arr,
+             receptor_corrected_annual, receptor_corrected_max_day) = compute_receptor_flicker(
                 wtg_xy, rotor_diameter, hub_height, receptor_xy,
                 site_lat, site_lon,
                 year=int(year),
                 receiver_height=float(receiver_height),
                 min_sun_el_deg=float(min_sun_el),
+                daily_kt=daily_kt,
             )
 
         # Plot
@@ -406,18 +413,19 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
         # ── Cloud-corrected map (if available) ───────────────────────────────
         if flicker_corrected is not None:
             st.divider()
-            st.markdown("**Cloud-corrected estimate (indicative, not NEPC compliance)**")
+            st.markdown(
+                f"**Cloud-corrected estimate — {cloud_source}**  "
+                f"*(indicative only, not NEPC compliance)*")
             fig_c = plot_flicker_results(
-                wtg_xy, flicker_corrected, flicker_max_day * (sum(cloud_data.values())/12),
+                wtg_xy, flicker_corrected, flicker_corrected_max_day,
                 xx, yy, int(epsg_code),
                 contour_levels=contour_levels,
                 annual_threshold=DEFAULT_CLOUD_THRESHOLD,
                 use_satellite=use_satellite, alpha_fill=alpha_fill,
                 hub_height=hub_height, rotor_diameter=rotor_diameter, year=int(year),
                 receptor_xy=receptor_xy,
-                receptor_annual=(receptor_annual * (sum(cloud_data.values())/12)
-                                 if receptor_annual is not None else None),
-                receptor_max_day=receptor_max_day_arr,
+                receptor_annual=receptor_corrected_annual,
+                receptor_max_day=receptor_corrected_max_day,
                 receptor_names=receptor_names,
                 is_cloud_corrected=True,
             )
@@ -425,13 +433,23 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
             st.pyplot(fig_c, use_container_width=True)
             plt.close(fig_c)
 
-            # Monthly breakdown table
-            months = ["Jan","Feb","Mar","Apr","May","Jun",
-                      "Jul","Aug","Sep","Oct","Nov","Dec"]
-            st.markdown("**Monthly clearness index (NASA POWER)**")
-            kt_rows = [{"Month": months[m-1],
-                        "Clearness index (KT)": round(cloud_data.get(m, 1.0), 3)}
-                       for m in range(1, 13)]
+            # Monthly summary of daily KT values
+            import datetime as _dt
+            monthly_kt: dict[int, list] = {}
+            for doy, kt in daily_kt.items():
+                m = (_dt.date(int(year), 1, 1) + _dt.timedelta(days=doy - 1)).month
+                monthly_kt.setdefault(m, []).append(kt)
+            month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                           "Jul","Aug","Sep","Oct","Nov","Dec"]
+            kt_rows = [
+                {"Month": month_names[m - 1],
+                 "Mean KT": round(float(np.mean(v)), 3),
+                 "Min KT":  round(float(min(v)),      3),
+                 "Max KT":  round(float(max(v)),      3),
+                 "Days":    len(v)}
+                for m, v in sorted(monthly_kt.items())
+            ]
+            st.markdown(f"**Daily clearness index summary — {cloud_source}, {cloud_station}**")
             st.dataframe(pd.DataFrame(kt_rows), use_container_width=True, hide_index=True)
 
         # ── Receptor results table ────────────────────────────────────────────
@@ -441,16 +459,22 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
             rows = []
             for i, name in enumerate(receptor_names):
                 ann  = float(receptor_annual[i])
-                mday = float(receptor_max_day_arr[i]) * 60  # → minutes
-                ann_ok  = "✅" if ann  <= 30  else "❌"
-                day_ok  = "✅" if mday <= 30  else "❌"
-                rows.append({
-                    "Receptor":        name,
-                    "Annual (hr/yr)":  round(ann, 1),
-                    "≤30 hr/yr (NEPC)": ann_ok,
-                    "Max day (min)":    round(mday, 0),
-                    "≤30 min/day (DE)": day_ok,
-                })
+                mday = float(receptor_max_day_arr[i]) * 60
+                row = {
+                    "Receptor":          name,
+                    "Annual wc (hr/yr)": round(ann, 1),
+                    "≤30 hr/yr (NEPC)":  "✅" if ann  <= 30  else "❌",
+                    "Max day wc (min)":  round(mday, 0),
+                    "≤30 min/day (DE)":  "✅" if mday <= 30  else "❌",
+                }
+                if receptor_corrected_annual is not None:
+                    corr_ann  = float(receptor_corrected_annual[i])
+                    corr_mday = float(receptor_corrected_max_day[i]) * 60
+                    row[f"Annual corrected (hr/yr)"]  = round(corr_ann, 1)
+                    row[f"≤{DEFAULT_CLOUD_THRESHOLD:g} hr/yr (corrected)"] = (
+                        "✅" if corr_ann <= DEFAULT_CLOUD_THRESHOLD else "❌")
+                    row["Max day corrected (min)"] = round(corr_mday, 0)
+                rows.append(row)
             st.dataframe(pd.DataFrame(rows).set_index("Receptor"),
                          use_container_width=True)
 

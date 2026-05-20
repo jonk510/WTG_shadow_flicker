@@ -44,53 +44,109 @@ def get_site_latlon(wtg_xy: np.ndarray, epsg_code: int) -> tuple[float, float]:
     return lat, lon
 
 
-# ── Cloud correction via NASA POWER ──────────────────────────────────────────
-def fetch_cloud_correction(lat: float, lon: float, year: int) -> dict[int, float]:
+# ── Cloud / sunshine data ─────────────────────────────────────────────────────
+def fetch_daily_sunshine(
+    lat: float, lon: float, year: int,
+) -> tuple[dict[int, float], str, str]:
     """
-    Fetch monthly clearness index (ALLSKY_KT) from NASA POWER API.
-    Returns {month_number: clearness_index} where 0 = fully overcast, 1 = clear.
-    Used to convert worst-case (no cloud) flicker to a realistic estimate.
+    Fetch daily clearness index for the full year.
 
-    Reference: NEPC 2010 guidelines use worst-case; cloud correction gives
-    a realistic (non-compliance) estimate.
+    Returns
+    -------
+    daily_kt    : {day_of_year: clearness_index}  (DOY 1-indexed, 1 = Jan 1)
+                  clearness_index: 0 = fully overcast, 1 = clear sky
+    source      : human-readable data source label
+    station_info: nearest station description (or "satellite-derived")
+
+    Strategy
+    --------
+    1. Try nearest BOM station via meteostat (daily sunshine duration → kt).
+       Requires `pip install meteostat`. Falls back if unavailable or <180 days.
+    2. Fall back to NASA POWER daily ALLSKY_KT (satellite-derived).
     """
-    import requests
+    import datetime, requests
+    import numpy as np
+    import pandas as pd
+    import pvlib
+
+    # Pre-compute astronomical daylight minutes per day (for sunshine-duration→kt)
+    times = pd.date_range(f"{year}-01-01", f"{year+1}-01-01", freq="1h", tz="UTC")[:-1]
+    n_days = len(times) // 24
+    solpos = pvlib.solarposition.get_solarposition(times, lat, lon)
+    el_arr = solpos["apparent_elevation"].values
+    max_day_min = np.array(
+        [int((el_arr[d * 24:(d + 1) * 24] > 0).sum()) * 60 for d in range(n_days)],
+        dtype=np.float32,
+    )
+
+    # ── Option 1: BOM station via meteostat ───────────────────────────────────
+    try:
+        from meteostat import Point, Daily as MetDaily, Stations
+
+        point    = Point(lat, lon)
+        start_dt = datetime.datetime(year, 1, 1)
+        end_dt   = datetime.datetime(year, 12, 31)
+        df = MetDaily(point, start_dt, end_dt).fetch()
+
+        if not df.empty and "tsun" in df.columns:
+            tsun_vals = df["tsun"].values.astype(float)   # sunshine minutes/day
+            valid     = np.isfinite(tsun_vals)
+
+            if valid.sum() >= 180:
+                kt_daily: dict[int, float] = {}
+                for d in range(min(len(tsun_vals), n_days)):
+                    if valid[d] and max_day_min[d] > 0:
+                        doy = d + 1
+                        kt_daily[doy] = float(np.clip(tsun_vals[d] / max_day_min[d], 0.0, 1.0))
+
+                # Fill gaps with that month's mean from available data
+                monthly_sums: dict[int, list] = {}
+                for doy, kt in kt_daily.items():
+                    m = (datetime.date(year, 1, 1) + datetime.timedelta(days=doy - 1)).month
+                    monthly_sums.setdefault(m, []).append(kt)
+                monthly_mean = {m: float(np.mean(v)) for m, v in monthly_sums.items()}
+                for d in range(n_days):
+                    doy = d + 1
+                    if doy not in kt_daily:
+                        m = (datetime.date(year, 1, 1) + datetime.timedelta(days=d)).month
+                        kt_daily[doy] = monthly_mean.get(m, 0.7)
+
+                # Nearest station name and distance
+                try:
+                    stn = Stations().nearby(lat, lon).fetch(1)
+                    if not stn.empty:
+                        name = stn.iloc[0].get("name", "?")
+                        dist_km = float(stn.iloc[0].get("distance", 0)) / 1000
+                        stn_info = f"{name} ({dist_km:.1f} km)"
+                    else:
+                        stn_info = "nearest station"
+                except Exception:
+                    stn_info = "nearest station"
+
+                return kt_daily, "BOM / meteostat — daily sunshine duration", stn_info
+    except Exception:
+        pass
+
+    # ── Option 2: NASA POWER daily clearness index ────────────────────────────
     url = (
-        "https://power.larc.nasa.gov/api/temporal/monthly/point"
+        "https://power.larc.nasa.gov/api/temporal/daily/point"
         f"?parameters=ALLSKY_KT&community=RE"
         f"&longitude={lon:.4f}&latitude={lat:.4f}"
-        f"&start={year}&end={year}&format=JSON"
+        f"&start={year}0101&end={year}1231&format=JSON"
     )
-    resp = requests.get(url, timeout=20)
+    resp = requests.get(url, timeout=30)
     resp.raise_for_status()
-    raw = resp.json()
-    monthly_raw = raw["properties"]["parameter"]["ALLSKY_KT"]
-    # API returns {"YYYYMM": value, ...}
-    result = {}
-    for key, val in monthly_raw.items():
+    raw      = resp.json()
+    daily_raw = raw["properties"]["parameter"]["ALLSKY_KT"]
+    kt_daily  = {}
+    for key, val in daily_raw.items():
         try:
-            month = int(str(key)[4:6])  # YYYYMM → MM
-            if 1 <= month <= 12:
-                result[month] = float(val)
-        except (ValueError, IndexError):
+            d   = datetime.date(int(key[:4]), int(key[4:6]), int(key[6:8]))
+            doy = d.timetuple().tm_yday
+            kt_daily[doy] = float(np.clip(float(val), 0.0, 1.0))
+        except Exception:
             pass
-    return result
-
-
-def apply_cloud_correction(
-    flicker_by_month: dict[int, np.ndarray],
-    cloud_correction: dict[int, float],
-) -> np.ndarray:
-    """
-    Apply monthly clearness index to monthly flicker grids.
-    Returns corrected annual flicker array.
-    """
-    corrected = None
-    for month, grid in flicker_by_month.items():
-        kt = cloud_correction.get(month, 1.0)
-        c = grid * kt
-        corrected = c if corrected is None else corrected + c
-    return corrected if corrected is not None else np.zeros(1)
+    return kt_daily, "NASA POWER — daily clearness index", "satellite-derived"
 
 
 # ── Core flicker computation ──────────────────────────────────────────────────
@@ -105,8 +161,9 @@ def compute_shadow_flicker(
     year: int = 2024,
     receiver_height: float = DEFAULT_RECEIVER_HT_M,
     min_sun_el_deg: float = DEFAULT_MIN_SUN_EL_DEG,
+    daily_kt: "dict[int, float] | None" = None,
     progress_cb=None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple:
     """
     Compute shadow flicker across a 2-D grid.
 
@@ -120,13 +177,18 @@ def compute_shadow_flicker(
     year           : calendar year for sun positions
     receiver_height: receptor height above local ground (m)
     min_sun_el_deg : minimum sun elevation to process (deg)
+    daily_kt       : optional {day_of_year: clearness_index} from fetch_daily_sunshine.
+                     When supplied, a cloud-corrected accumulator runs in parallel
+                     inside the day loop — no post-hoc approximation.
     progress_cb    : optional callable(fraction) for progress reporting
 
     Returns
     -------
-    flicker_annual    : (ny, nx) float32 — total flicker hours/year
-    flicker_max_day   : (ny, nx) float32 — max flicker hours in any single day
-    flicker_by_month  : dict {month: (ny, nx)} — monthly totals for cloud correction
+    flicker_annual          : (ny, nx) float32 — worst-case hours/year
+    flicker_max_day         : (ny, nx) float32 — worst-case max hours any single day
+    flicker_by_month        : dict {month: (ny, nx)} — worst-case monthly totals
+    flicker_corrected       : (ny, nx) float32 or None — cloud-corrected annual
+    flicker_corrected_max_day : (ny, nx) float32 or None — cloud-corrected max day
     """
     try:
         import pvlib
@@ -171,6 +233,13 @@ def compute_shadow_flicker(
     flicker_by_month: dict[int, np.ndarray] = {m: np.zeros((ny, nx), dtype=np.float32)
                                                 for m in range(1, 13)}
 
+    if daily_kt is not None:
+        flicker_corrected         = np.zeros((ny, nx), dtype=np.float32)
+        flicker_corrected_max_day = np.zeros((ny, nx), dtype=np.float32)
+    else:
+        flicker_corrected         = None
+        flicker_corrected_max_day = None
+
     # Build day → index-into-sun_az_up mapping once
     from collections import defaultdict
     day_hours: dict[int, list[int]] = defaultdict(list)
@@ -204,10 +273,19 @@ def compute_shadow_flicker(
         month = (ref_jan1 + datetime.timedelta(days=int(day))).month
         flicker_by_month[month] += day_flicker
 
+        # Cloud-corrected accumulator — each day scaled by that day's clearness
+        if daily_kt is not None:
+            kt = np.float32(daily_kt.get(day + 1, 1.0))   # day is 0-indexed; DOY is 1-indexed
+            corrected_day = day_flicker * kt
+            flicker_corrected         += corrected_day
+            np.maximum(flicker_corrected_max_day, corrected_day,
+                       out=flicker_corrected_max_day)
+
         if progress_cb is not None:
             progress_cb((step + 1) / n_days_sun)
 
-    return flicker_annual, flicker_max_day, flicker_by_month
+    return (flicker_annual, flicker_max_day, flicker_by_month,
+            flicker_corrected, flicker_corrected_max_day)
 
 
 def compute_receptor_flicker(
@@ -220,19 +298,32 @@ def compute_receptor_flicker(
     year: int = 2024,
     receiver_height: float = DEFAULT_RECEIVER_HT_M,
     min_sun_el_deg: float = DEFAULT_MIN_SUN_EL_DEG,
-) -> tuple[np.ndarray, np.ndarray]:
+    daily_kt: "dict[int, float] | None" = None,
+) -> tuple:
     """
     Flicker at discrete receptor points.
-    Returns (annual_hrs, max_day_hrs), each shape (N_receptors,).
+
+    Returns
+    -------
+    annual_hrs            : (N,) worst-case annual hours
+    max_day_hrs           : (N,) worst-case max hours in any single day
+    corrected_annual_hrs  : (N,) cloud-corrected annual hours, or None
+    corrected_max_day_hrs : (N,) cloud-corrected max day hours, or None
     """
     rx = receptor_xy[:, 0].reshape(1, -1).astype(np.float32)
     ry = receptor_xy[:, 1].reshape(1, -1).astype(np.float32)
-    annual, max_day, _ = compute_shadow_flicker(
+    annual, max_day, _, corrected, corrected_max_day = compute_shadow_flicker(
         wtg_xy, rotor_diameter, hub_height, rx, ry,
         site_lat, site_lon, year=year,
         receiver_height=receiver_height, min_sun_el_deg=min_sun_el_deg,
+        daily_kt=daily_kt,
     )
-    return annual.ravel(), max_day.ravel()
+    return (
+        annual.ravel(),
+        max_day.ravel(),
+        corrected.ravel() if corrected is not None else None,
+        corrected_max_day.ravel() if corrected_max_day is not None else None,
+    )
 
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
