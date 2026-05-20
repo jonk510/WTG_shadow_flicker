@@ -251,14 +251,15 @@ with c2:
 | Buffer | {buffer_m:.0f} m |
     """)
 
-    st.subheader("3 · SA / International Guidelines")
+    st.subheader("3 · NEPC 2010 Guidelines")
     st.markdown("""
-| Criterion | Threshold |
-|-----------|-----------|
-| Annual flicker | **30 hr/yr** |
-| Daily flicker | **30 min/day** |
+| Criterion | Threshold | Source |
+|-----------|-----------|--------|
+| Annual flicker (worst-case) | **≤ 30 hr/yr** | NEPC 2010 |
+| Daily flicker | **≤ 30 min/day** | German practice |
+| Assessment distance | **265 × max blade chord** | NEPC 2010 |
 
-*South Australia EPA Wind Farm Guidelines 2021 · German TA Lärm approach*
+*NEPC 2010 states no daily limit is required — it is inherently satisfied by the annual limit for Australian sites. The 30 min/day column is shown for reference only (German TA Lärm practice).*
     """)
 
 # ── Sensitive receptors ───────────────────────────────────────────────────────
@@ -441,9 +442,9 @@ if st.button("Run Shadow Flicker Analysis", type="primary",
                 rows.append({
                     "Receptor":        name,
                     "Annual (hr/yr)":  round(ann, 1),
-                    "≤30 hr/yr":       ann_ok,
-                    "Max day (min)":   round(mday, 0),
-                    "≤30 min/day":     day_ok,
+                    "≤30 hr/yr (NEPC)": ann_ok,
+                    "Max day (min)":    round(mday, 0),
+                    "≤30 min/day (DE)": day_ok,
                 })
             st.dataframe(pd.DataFrame(rows).set_index("Receptor"),
                          use_container_width=True)
