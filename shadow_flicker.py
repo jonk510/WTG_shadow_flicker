@@ -28,8 +28,9 @@ DEFAULT_ROTOR_DIAM_M    = 180.0
 DEFAULT_BLADE_CHORD_M   = 4.5                 # typical blade chord (m)
 # NEPC 2010: assess within 265 × max blade chord
 NEPC_CHORD_MULTIPLIER   = 265
-DEFAULT_ANNUAL_THRESHOLD  = 30.0   # NEPC 2010 annual limit (hr/yr)
-DEFAULT_CLOUD_THRESHOLD   = 8.0    # indicative actual limit with cloud correction (hr/yr)
+DEFAULT_ANNUAL_THRESHOLD  = 30.0                        # NEPC 2010 annual limit (hr/yr)
+DEFAULT_CLOUD_THRESHOLD   = 8.0                         # indicative actual limit with cloud correction (hr/yr)
+DEFAULT_FLICKER_LEVELS    = [5, 10, 20, 30, 50, 100]   # contour levels (hrs/yr)
 DEFAULT_EPSG            = 7850                     # GDA2020 / MGA zone 50
 
 
@@ -241,19 +242,32 @@ import matplotlib.pyplot as plt
 import matplotlib.patheffects as mpe
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
-from matplotlib.colors import Normalize
+import matplotlib.colors as mcolors
 from matplotlib.path import Path as MplPath
 
+# Shadow flicker contour fill colours — green → yellow → orange → red → purple
+_FLICKER_COLOURS = [
+    "#27ae60", "#a9d65d", "#f9ca24", "#f0932b", "#eb4d4b", "#8e44ad", "#2d3436",
+]
 
-def _threshold_fill(ax, xx, yy, data, threshold, cmap="YlOrRd", alpha=0.65):
-    """Smooth gradient fill + single dashed contour line at threshold."""
-    vmax = max(float(data.max()), threshold * 1.2)
-    levels = np.linspace(0, vmax, 64)
+
+def _flicker_cmap_norm(levels):
+    n      = len(levels) - 1
+    colors = (_FLICKER_COLOURS * ((n // len(_FLICKER_COLOURS)) + 1))[:n]
+    cmap   = mcolors.ListedColormap(colors)
+    norm   = mcolors.BoundaryNorm(levels, len(colors))
+    return cmap, norm
+
+
+def _add_flicker_contours(ax, xx, yy, data, levels, alpha_fill=0.55):
+    """Filled + labelled flicker contours matching the noise analyser style."""
+    cmap, norm = _flicker_cmap_norm(levels)
     cf = ax.contourf(xx, yy, data, levels=levels,
-                     cmap=cmap, alpha=alpha, extend="max")
-    cl = ax.contour(xx, yy, data, levels=[threshold],
-                    colors=["#cc0000"], linewidths=2.5, linestyles="--")
-    return cf, cl, vmax
+                     cmap=cmap, norm=norm, alpha=alpha_fill, extend="both")
+    cl = ax.contour(xx, yy, data, levels=levels,
+                    colors="black", linewidths=0.8, alpha=0.9)
+    ax.clabel(cl, fmt="%g hr/yr", fontsize=18, inline=True)
+    return cf
 
 
 def _make_wtg_marker():
@@ -335,14 +349,21 @@ def _scatter_flicker_receptors(ax, receptor_xy, annual_hrs, max_day_hrs,
 def plot_flicker_results(
     wtg_xy, flicker_annual, flicker_max_day, xx, yy,
     epsg_code,
+    contour_levels=None,
     annual_threshold=DEFAULT_ANNUAL_THRESHOLD,
-    use_satellite=True, bing_key=None, alpha_fill=0.60,
+    use_satellite=True, bing_key=None, alpha_fill=0.55,
     hub_height=None, rotor_diameter=None, year=2024,
     receptor_xy=None, receptor_annual=None,
     receptor_max_day=None, receptor_names=None,
     is_cloud_corrected=False,
     save_path=None,
 ):
+    if contour_levels is None:
+        contour_levels = list(DEFAULT_FLICKER_LEVELS)
+    if annual_threshold not in contour_levels:
+        contour_levels = sorted(set(contour_levels) | {annual_threshold})
+
+    cmap, norm = _flicker_cmap_norm(contour_levels)
     xmin, xmax = float(xx.min()), float(xx.max())
     ymin, ymax = float(yy.min()), float(yy.max())
 
@@ -369,9 +390,10 @@ def plot_flicker_results(
     ax_ann.set_ylim(ymin, ymax)
     sat_ok = _add_satellite(ax_ann, epsg_code, bing_key) if use_satellite else False
 
-    _, cl1, vmax_ann = _threshold_fill(
-        ax_ann, xx, yy, flicker_annual, annual_threshold, alpha=alpha_fill)
-    ax_ann.clabel(cl1, fmt=f"{annual_threshold:g} hr/yr", fontsize=18, inline=True)
+    _add_flicker_contours(ax_ann, xx, yy, flicker_annual, contour_levels, alpha_fill)
+    # Regulatory threshold highlighted with a bold red dashed line on top
+    ax_ann.contour(xx, yy, flicker_annual, levels=[annual_threshold],
+                   colors=["#cc0000"], linewidths=3.0, linestyles="--", zorder=5)
 
     _scatter_turbines(ax_ann, wtg_xy)
 
@@ -379,7 +401,7 @@ def plot_flicker_results(
         Line2D([0], [0], marker=_WTG_MARKER, color="w",
                markerfacecolor="white", markeredgecolor="black",
                markersize=14, label="Wind turbine"),
-        Line2D([0], [0], color="#cc0000", lw=2.5, linestyle="--",
+        Line2D([0], [0], color="#cc0000", lw=3.0, linestyle="--",
                label=f"{annual_threshold:g} hr/yr limit"),
     ]
     if receptor_xy is not None and receptor_annual is not None:
@@ -398,24 +420,33 @@ def plot_flicker_results(
     _format_map_axis(ax_ann)
     ax_ann.legend(handles=legend_handles, loc="upper left",
                   fontsize=20, framealpha=0.85)
-    sm1 = plt.cm.ScalarMappable(cmap="YlOrRd", norm=Normalize(0, vmax_ann))
+    sm1 = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm1.set_array([])
     cb1 = fig.colorbar(sm1, ax=ax_ann, shrink=0.80, pad=0.02, aspect=28)
+    cb1.set_ticks(contour_levels)
     cb1.set_label("Shadow flicker (hours/year)", fontsize=20)
     cb1.ax.tick_params(labelsize=18)
 
     # ── Panel 2 : max hours/day ───────────────────────────────────────────────
-    DAY_THRESHOLD = 0.5   # 30 min/day in hours
-    _, cl2, vmax_day = _threshold_fill(
-        ax_day, xx, yy, flicker_max_day, DAY_THRESHOLD, alpha=0.80)
-    ax_day.clabel(cl2, fmt="30 min/day", fontsize=12, inline=True)
+    day_levels = [0.1, 0.25, 0.5, 1.0, 2.0]
+    cmap_d, norm_d = _flicker_cmap_norm(day_levels)
+    _add_flicker_contours(ax_day, xx, yy, flicker_max_day, day_levels, 0.80)
+    # Override labels to show minutes instead of hours
+    ax_day.clabel(
+        ax_day.contour(xx, yy, flicker_max_day, levels=day_levels,
+                       colors="none", linewidths=0),
+        fmt=lambda v: f"{v * 60:.0f} min/day", fontsize=12, inline=True)
+    ax_day.contour(xx, yy, flicker_max_day, levels=[0.5],
+                   colors=["#cc0000"], linewidths=2.5, linestyles="--", zorder=5)
     _scatter_turbines(ax_day, wtg_xy)
     ax_day.set_title("Max Flicker — Single Day (hr/day)",
                      fontsize=14, fontweight="bold")
     _format_map_axis(ax_day)
-    sm2 = plt.cm.ScalarMappable(cmap="YlOrRd", norm=Normalize(0, vmax_day))
+    sm2 = plt.cm.ScalarMappable(cmap=cmap_d, norm=norm_d)
     sm2.set_array([])
     cb2 = fig.colorbar(sm2, ax=ax_day, shrink=0.80, pad=0.02, aspect=28)
+    cb2.set_ticks(day_levels)
+    cb2.set_ticklabels([f"{v * 60:.0f} min" for v in day_levels])
     cb2.set_label("Max flicker (hr/day)", fontsize=11)
     cb2.ax.tick_params(labelsize=10)
 
@@ -437,6 +468,9 @@ def plot_flicker_results(
     ax_dist.plot(bin_r, bin_max, "b-", lw=2.0, label="Max hr/yr")
     ax_dist.axhline(annual_threshold, color="#cc0000", lw=2.0, linestyle="--",
                     label=f"{annual_threshold:g} hr/yr limit")
+    for lv in contour_levels:
+        if lv != annual_threshold:
+            ax_dist.axhline(lv, color="grey", lw=0.7, linestyle=":", alpha=0.6)
     ax_dist.set_xlabel("Distance from layout centroid (m)", fontsize=13)
     ax_dist.set_ylabel("Max shadow flicker (hr/yr)", fontsize=13)
     ax_dist.set_title("Flicker vs. Distance", fontsize=14, fontweight="bold")
@@ -448,34 +482,48 @@ def plot_flicker_results(
     ax_dist.tick_params(labelsize=12)
     ax_dist.legend(fontsize=11)
 
-    mask_thr = flat >= annual_threshold
-    if mask_thr.any():
-        r_thr = float(r_from_cen[mask_thr].max())
-        ax_dist.axvline(r_thr, color="#cc0000", lw=0.8, linestyle=":")
-        ax_dist.text(r_thr, ymax_dist * 0.92,
-                     f"{r_thr:.0f} m", fontsize=10, color="#cc0000", ha="center")
+    for lv in contour_levels:
+        mask_lv = flat >= lv
+        if mask_lv.any():
+            r_lv = float(r_from_cen[mask_lv].max())
+            col = "#cc0000" if lv == annual_threshold else "grey"
+            lw  = 1.2 if lv == annual_threshold else 0.8
+            ax_dist.axvline(r_lv, color=col, lw=lw, linestyle=":")
+            y_txt = ymax_dist * (0.92 if lv == annual_threshold else 0.78)
+            ax_dist.text(r_lv, y_txt, f"{r_lv:.0f} m",
+                         fontsize=9, color=col, ha="center")
 
     # ── Panel 4 : summary stats ───────────────────────────────────────────────
     ax_info.axis("off")
     max_ann  = float(flicker_annual.max())
     max_day  = float(flicker_max_day.max())
 
-    mask_thr2 = flat >= annual_threshold
-    r_thr2    = float(r_from_cen[mask_thr2].max()) if mask_thr2.any() else 0.0
-    mode_str  = "Cloud-corrected" if is_cloud_corrected else "Worst-case"
+    mask_thr = flat >= annual_threshold
+    r_thr    = float(r_from_cen[mask_thr].max()) if mask_thr.any() else 0.0
+    mode_str = "Cloud-corrected" if is_cloud_corrected else "Worst-case"
 
+    thr_label = (f"Annual:    {annual_threshold:g} hr/yr (NEPC 2010)"
+                 if not is_cloud_corrected
+                 else f"Annual:    {annual_threshold:g} hr/yr (cloud-corrected)")
+    contour_radii = [
+        f"  {lv:>5g} hr/yr  {float(r_from_cen[flat >= lv].max()):.0f} m"
+        if (flat >= lv).any() else f"  {lv:>5g} hr/yr  < grid"
+        for lv in contour_levels
+    ]
     lines = [
         "── Assessment Summary ──",
         "",
-        f"Mode:                 {mode_str}",
-        f"Peak annual flicker:  {max_ann:.1f} hr/yr",
-        f"Peak single-day:       {max_day * 60:.0f} min/day",
-        f"{annual_threshold:g} hr/yr radius:  {r_thr2:.0f} m",
+        f"Mode:            {mode_str}",
+        f"Peak annual:     {max_ann:.1f} hr/yr",
+        f"Peak single-day: {max_day * 60:.0f} min/day",
+        "",
+        "── Contour radii ──",
+        "",
+    ] + contour_radii + [
         "",
         "── Guideline thresholds ──",
         "",
-        f"Annual:    {annual_threshold:g} hr/yr (NEPC 2010)" if not is_cloud_corrected
-        else f"Annual:    {annual_threshold:g} hr/yr (cloud-corrected)",
+        thr_label,
         "Daily:     30 min/day (German practice)",
         "",
         "── Model notes ──",
@@ -487,7 +535,7 @@ def plot_flicker_results(
     ]
     ax_info.text(0.05, 0.95, "\n".join(lines),
                  transform=ax_info.transAxes,
-                 fontsize=12, va="top", fontfamily="monospace",
+                 fontsize=11, va="top", fontfamily="monospace",
                  bbox=dict(boxstyle="round,pad=0.5", facecolor="#f8f8f8",
                            edgecolor="#aaaaaa", linewidth=1.0, alpha=0.95))
 
