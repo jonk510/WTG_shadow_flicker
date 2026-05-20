@@ -382,7 +382,7 @@ def plot_flicker_results(
                              markersize=14, label="Wind turbine")]
     if receptor_xy is not None and receptor_annual is not None:
         _scatter_flicker_receptors(ax_ann, receptor_xy, receptor_annual,
-                                   receptor_max_day or np.zeros(len(receptor_xy)),
+                                   receptor_max_day if receptor_max_day is not None else np.zeros(len(receptor_xy)),
                                    receptor_names)
         legend_handles.append(
             Line2D([0], [0], marker="D", color="w",
