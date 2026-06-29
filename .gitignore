@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.pdf
 .DS_Store
+.streamlit/secrets.toml
+secrets.toml
