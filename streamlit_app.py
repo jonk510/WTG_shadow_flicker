@@ -31,6 +31,12 @@ from shadow_flicker import (
 )
 
 
+# Make the shared library importable when running locally (not pip-installed).
+try:
+    import shared as _shared_pkg  # noqa: F401
+except ModuleNotFoundError:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from shared.geo_loaders import load_shapefile_points as _load_shapefile_points
 from shared.geo_loaders import load_kmz_points as _load_kmz_points
 
